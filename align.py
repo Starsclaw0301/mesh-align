@@ -1,5 +1,6 @@
 """
-mesh-align: 将高精度 OBJ 模型对齐到低精度 STL 模型的坐标系
+mesh-align: 将高精度网格模型对齐到低精度网格模型的坐标系
+支持格式：STL / OBJ（目标和源均可）
 方案：PCA 粗配准 + ICP 精配准
 目标精度：0.1mm (0.0001m)
 """
@@ -129,19 +130,19 @@ def run_icp(
 # ─────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="将高精度 OBJ 对齐到低精度 STL 坐标系")
-    parser.add_argument("stl", help="低精度 STL 文件路径（目标坐标系）")
-    parser.add_argument("obj", help="高精度 OBJ 文件路径（需对齐）")
-    parser.add_argument("-o", "--output", default="aligned.obj", help="输出 OBJ 路径")
+    parser = argparse.ArgumentParser(description="将高精度网格对齐到低精度网格的坐标系（支持 STL/OBJ）")
+    parser.add_argument("target", help="目标坐标系网格文件（低精度，STL 或 OBJ）")
+    parser.add_argument("source", help="待对齐网格文件（高精度，STL 或 OBJ）")
+    parser.add_argument("-o", "--output", default="aligned.obj", help="输出文件路径（默认 aligned.obj）")
     parser.add_argument("-n", "--n-points", type=int, default=50000, help="采样点数（默认 50000）")
     parser.add_argument("--save-matrix", default="transform.npy", help="保存 4×4 变换矩阵路径")
     args = parser.parse_args()
 
-    print(f"[1/5] 加载 STL: {args.stl}")
-    tgt_pcd, _ = load_and_sample(args.stl, args.n_points)
+    print(f"[1/5] 加载目标网格: {args.target}")
+    tgt_pcd, _ = load_and_sample(args.target, args.n_points)
 
-    print(f"[2/5] 加载 OBJ: {args.obj}")
-    src_pcd, _ = load_and_sample(args.obj, args.n_points)
+    print(f"[2/5] 加载源网格: {args.source}")
+    src_pcd, _ = load_and_sample(args.source, args.n_points)
 
     print("[3/5] PCA 粗配准（生成 4 个候选变换）...")
     candidates = pca_rough_align(src_pcd, tgt_pcd)
@@ -178,13 +179,13 @@ def main():
     np.save(args.save_matrix, best_T)
     print(f"\n[5/5] 变换矩阵已保存: {args.save_matrix}")
 
-    # 应用变换并输出对齐后的 OBJ
-    mesh_src = trimesh.load(args.obj, force="mesh")
+    # 应用变换并输出对齐后的文件
+    mesh_src = trimesh.load(args.source, force="mesh")
     if isinstance(mesh_src, trimesh.Scene):
         mesh_src = trimesh.util.concatenate(list(mesh_src.geometry.values()))
     mesh_src.apply_transform(best_T)
     mesh_src.export(args.output)
-    print(f"对齐后的 OBJ 已保存: {args.output}")
+    print(f"对齐后的网格已保存: {args.output}")
 
 
 if __name__ == "__main__":
