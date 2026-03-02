@@ -127,15 +127,13 @@ def auto_params(pcd_ref: o3d.geometry.PointCloud,
                 ) -> Tuple[float, float]:
     """根据模型实际尺寸自动计算 voxel_size 和 max_icp_dist。
 
-    注意: 应在尺度补偿之后调用, 此时两个点云应处于同一尺度。
-
     策略:
-      voxel_size  = 对角线的 1.5%  (经验值, 平衡速度与精度)
-      max_icp_dist = 对角线的 5%   (允许足够的搜索范围)
+      voxel_size   = 对角线的 1.5%
+      max_icp_dist = 对角线的 1%   (之前 5% 太大，容易错误匹配)
     """
     diag = max(_get_pcd_diagonal(pcd_ref), _get_pcd_diagonal(pcd_src), 1e-6)
     voxel_size = diag * 0.015
-    max_icp_dist = diag * 0.05
+    max_icp_dist = diag * 0.01
     return voxel_size, max_icp_dist
 
 
@@ -395,15 +393,16 @@ def align_one_pair(
         print(f"    粗配准 fitness={global_result.fitness:.4f}, RMSE={global_result.inlier_rmse:.6f}")
 
     # ---- ICP 精细配准 ----
-    print(f"  ICP 精细配准 (max_dist={max_icp_dist}) ...")
-    # 多尺度 ICP: 从粗到细
-    current_transform = init_transform
-    for dist_factor in [5.0, 2.0, 1.0]:
-        dist = max_icp_dist * dist_factor
-        icp_result = refine_icp(pcd_src, pcd_ref, current_transform, dist)
-        current_transform = icp_result.transformation
+    print(f"  ICP 精细配准 ...")
+    # 起始距离取 RANSAC RMSE 的 3 倍（保证初始有足够对应点），再逐步收紧
+    if do_global:
+        icp_start_dist = max(global_result.inlier_rmse * 3, max_icp_dist)
+    else:
+        icp_start_dist = max_icp_dist
+    print(f"    ICP 起始距离={icp_start_dist*1000:.2f}mm")
+    icp_result = refine_icp(pcd_src, pcd_ref, init_transform, icp_start_dist)
 
-    final_transform = current_transform
+    final_transform = icp_result.transformation
     print(f"    精配准 fitness={icp_result.fitness:.4f}, RMSE={icp_result.inlier_rmse*1000:.4f}mm")
 
     # 精度验证：最近邻点距离统计
