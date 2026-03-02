@@ -1,189 +1,537 @@
+#!/usr/bin/env python3
+"""将高精度 OBJ 模型对齐到低精度 STL/OBJ 参考模型的坐标系。
+
+原理:
+  1. 从两个网格分别采样点云
+  2. 用 FPFH 特征 + RANSAC 做全局粗配准 (解决大角度偏移)
+  3. 用 ICP 做精细配准 (亚毫米级精度)
+  4. 将变换矩阵应用到高精度 OBJ (保留材质/UV/法线), 输出对齐后的 OBJ
+
+依赖:  pip install open3d trimesh numpy
+用法:
+  # 单对对齐
+  python align_meshes.py \
+      --ref  chairbot-urdf-0212/meshes/base_link.STL \
+      --src  id_mesh/meshes_aligned/base_link.obj \
+      --out  id_mesh/meshes_output/base_link.obj
+
+  # 批量对齐 (自动匹配同名零件)
+  python align_meshes.py \
+      --ref-dir  chairbot-urdf-0212/meshes \
+      --src-dir  id_mesh/meshes_aligned \
+      --out-dir  id_mesh/meshes_output \
+      --ref-ext .STL --src-ext .obj
+
+  # 可选参数
+  --voxel-size 0.005   # 点云降采样体素大小 (米), 影响速度和精度
+  --max-icp-dist 0.01  # ICP 最大对应点距离 (米)
+  --no-global           # 跳过全局配准 (若初始对齐已大致正确)
+  --no-scale            # 禁用自动尺度补偿 (默认自动检测 10x/100x 等尺度差异)
 """
-mesh-align: 将高精度网格模型对齐到低精度网格模型的坐标系
-支持格式：STL / OBJ（目标和源均可）
-方案：FPFH 特征提取 + RANSAC 全局配准 + ICP 精配准
-目标精度：0.1mm (0.0001m)
-"""
+
+from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+from typing import Tuple
+
 import numpy as np
-import open3d as o3d
-import trimesh
 
-# ─────────────────────────────────────────
-# 1. 加载网格并采样点云
-# ─────────────────────────────────────────
+try:
+    import open3d as o3d
+except ImportError:
+    print("需要 open3d: pip install open3d", file=sys.stderr)
+    sys.exit(1)
 
-def load_and_sample(path: str, n_points: int = 50000) -> o3d.geometry.PointCloud:
-    """加载 STL/OBJ 并均匀采样点云"""
-    mesh = trimesh.load(path, force="mesh")
-    if isinstance(mesh, trimesh.Scene):
-        mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+try:
+    import trimesh
+except ImportError:
+    print("需要 trimesh: pip install trimesh", file=sys.stderr)
+    sys.exit(1)
 
-    points, _ = trimesh.sample.sample_surface(mesh, n_points)
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+# ──────────────────────────────────────────────
+# 1. 网格 → 点云
+# ──────────────────────────────────────────────
+
+def mesh_to_pointcloud(mesh_path: str | Path, num_points: int = 50000) -> o3d.geometry.PointCloud:
+    """加载 STL/OBJ 网格并采样为 Open3D 点云。"""
+    mesh_path = Path(mesh_path)
+    # 用 trimesh 加载 (兼容 STL/OBJ/PLY 等)
+    tm = trimesh.load(str(mesh_path), force="mesh")
+    if isinstance(tm, trimesh.Scene):
+        meshes = [g for g in tm.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        tm = trimesh.util.concatenate(meshes)
+
+    # 转换为 Open3D mesh
+    o3d_mesh = o3d.geometry.TriangleMesh()
+    o3d_mesh.vertices = o3d.utility.Vector3dVector(np.asarray(tm.vertices))
+    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(tm.faces))
+    o3d_mesh.compute_vertex_normals()
+
+    # 均匀采样点云
+    pcd = o3d_mesh.sample_points_uniformly(number_of_points=num_points)
     return pcd
 
 
-def preprocess(pcd: o3d.geometry.PointCloud, voxel_size: float):
-    """下采样 + 法线估算 + FPFH 特征"""
-    down = pcd.voxel_down_sample(voxel_size)
-    down.estimate_normals(
+
+# ──────────────────────────────────────────────
+# 2. 尺度估计与自动参数
+# ──────────────────────────────────────────────
+
+def _get_pcd_diagonal(pcd: o3d.geometry.PointCloud) -> float:
+    """计算点云 AABB 对角线长度。"""
+    bb = pcd.get_axis_aligned_bounding_box()
+    return float(np.linalg.norm(bb.get_max_bound() - bb.get_min_bound()))
+
+
+def estimate_scale(pcd_ref: o3d.geometry.PointCloud,
+                   pcd_src: o3d.geometry.PointCloud) -> float:
+    """通过 AABB 对角线比值估算两个点云的尺度比, 并 snap 到常见整数倍。
+
+    返回 scale 使得 src * scale ≈ ref 的尺度。
+
+    当 raw ratio 接近 10 的整数次幂 (0.001, 0.01, 0.1, 1, 10, 100, 1000)
+    时, 自动 snap 到该整数倍, 避免浮点漂移。
+    """
+    ref_diag = _get_pcd_diagonal(pcd_ref)
+    src_diag = _get_pcd_diagonal(pcd_src)
+    if src_diag < 1e-12:
+        return 1.0
+
+    raw_ratio = ref_diag / src_diag
+
+    # 常见尺度因子 (覆盖 mm↔m, cm↔m, inch↔mm 等)
+    NICE_FACTORS = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+    SNAP_TOLERANCE = 0.30  # 30% 容差
+
+    best_factor = raw_ratio
+    best_err = float("inf")
+    for f in NICE_FACTORS:
+        rel_err = abs(raw_ratio - f) / f
+        if rel_err < best_err:
+            best_err = rel_err
+            best_factor = f
+
+    if best_err < SNAP_TOLERANCE:
+        print(f"  尺度检测: raw_ratio={raw_ratio:.4f} → snap 到 {best_factor}")
+        return float(best_factor)
+    else:
+        print(f"  尺度检测: raw_ratio={raw_ratio:.4f} (未匹配到整数倍, 直接使用)")
+        return float(raw_ratio)
+
+
+def auto_params(pcd_ref: o3d.geometry.PointCloud,
+                pcd_src: o3d.geometry.PointCloud
+                ) -> Tuple[float, float]:
+    """根据模型实际尺寸自动计算 voxel_size 和 max_icp_dist。
+
+    注意: 应在尺度补偿之后调用, 此时两个点云应处于同一尺度。
+
+    策略:
+      voxel_size  = 对角线的 1.5%  (经验值, 平衡速度与精度)
+      max_icp_dist = 对角线的 5%   (允许足够的搜索范围)
+    """
+    diag = max(_get_pcd_diagonal(pcd_ref), _get_pcd_diagonal(pcd_src), 1e-6)
+    voxel_size = diag * 0.015
+    max_icp_dist = diag * 0.05
+    return voxel_size, max_icp_dist
+
+
+# ──────────────────────────────────────────────
+# 3. FPFH 特征提取
+# ──────────────────────────────────────────────
+
+def preprocess_pcd(pcd: o3d.geometry.PointCloud,
+                   voxel_size: float
+                   ) -> Tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]:
+    """降采样 + 法线估计 + FPFH 特征计算。"""
+    pcd_down = pcd.voxel_down_sample(voxel_size)
+    pcd_down.estimate_normals(
         o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
     )
-    down.orient_normals_consistent_tangent_plane(10)
     fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-        down,
-        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5, max_nn=100),
+        pcd_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5, max_nn=100)
     )
-    return down, fpfh
+    return pcd_down, fpfh
 
 
-# ─────────────────────────────────────────
-# 2. RANSAC 全局配准
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 4. 全局配准 (RANSAC + FPFH)
+# ──────────────────────────────────────────────
 
-def ransac_registration(
-    src_down, tgt_down, src_fpfh, tgt_fpfh, voxel_size: float
+def global_registration(
+    src_down: o3d.geometry.PointCloud,
+    ref_down: o3d.geometry.PointCloud,
+    src_fpfh: o3d.pipelines.registration.Feature,
+    ref_fpfh: o3d.pipelines.registration.Feature,
+    voxel_size: float,
 ) -> o3d.pipelines.registration.RegistrationResult:
-    dist_thresh = voxel_size * 1.5
+    """RANSAC 全局配准: 通过 FPFH 特征匹配找到粗略位姿。"""
+    distance_threshold = voxel_size * 1.5
     result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        src_down, tgt_down,
-        src_fpfh, tgt_fpfh,
+        source=src_down,
+        target=ref_down,
+        source_feature=src_fpfh,
+        target_feature=ref_fpfh,
         mutual_filter=True,
-        max_correspondence_distance=dist_thresh,
+        max_correspondence_distance=distance_threshold,
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-        ransac_n=4,
+        ransac_n=3,
         checkers=[
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(dist_thresh),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold),
         ],
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(1000000, 0.999),
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(500000, 0.9999),
     )
     return result
 
 
-# ─────────────────────────────────────────
-# 3. ICP 精配准（两阶段）
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 5. ICP 精细配准
+# ──────────────────────────────────────────────
 
 def refine_icp(
     src_pcd: o3d.geometry.PointCloud,
-    tgt_pcd: o3d.geometry.PointCloud,
+    ref_pcd: o3d.geometry.PointCloud,
     init_transform: np.ndarray,
-    voxel_size: float,
+    max_distance: float,
 ) -> o3d.pipelines.registration.RegistrationResult:
-    """point-to-plane ICP 两阶段精配准"""
-    icp_method = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+    """Point-to-Plane ICP 精细配准。"""
+    # 确保有法线
+    if not src_pcd.has_normals():
+        src_pcd.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=max_distance * 2, max_nn=30)
+        )
+    if not ref_pcd.has_normals():
+        ref_pcd.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=max_distance * 2, max_nn=30)
+        )
 
-    # 阶段1：中等精度
-    r1 = o3d.pipelines.registration.registration_icp(
-        src_pcd, tgt_pcd,
-        max_correspondence_distance=voxel_size * 0.4,
+    result = o3d.pipelines.registration.registration_icp(
+        source=src_pcd,
+        target=ref_pcd,
+        max_correspondence_distance=max_distance,
         init=init_transform,
-        estimation_method=icp_method,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=200
+            relative_fitness=1e-8,
+            relative_rmse=1e-8,
+            max_iteration=200,
         ),
     )
-
-    # 阶段2：收紧到 0.1mm
-    r2 = o3d.pipelines.registration.registration_icp(
-        src_pcd, tgt_pcd,
-        max_correspondence_distance=0.0001,
-        init=r1.transformation,
-        estimation_method=icp_method,
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-10, relative_rmse=1e-10, max_iteration=500
-        ),
-    )
-
-    return r2 if r2.fitness > r1.fitness * 0.5 else r1
+    return result
 
 
-# ─────────────────────────────────────────
-# 4. 精度验证
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 6. OBJ 文本级变换 (保留材质/UV)
+# ──────────────────────────────────────────────
 
-def evaluate(src_pcd, tgt_pcd, transform) -> dict:
-    src_t = o3d.geometry.PointCloud(src_pcd)
-    src_t.transform(transform)
-    dists = np.asarray(src_t.compute_point_cloud_distance(tgt_pcd))
+def apply_transform_to_obj(
+    src_obj_path: Path,
+    out_obj_path: Path,
+    transform_4x4: np.ndarray,
+    scale: float = 1.0,
+):
+    """在文本级别对 OBJ 施加刚体变换, 完美保留 UV/材质/法线。
+
+    transform_4x4: 4x4 齐次变换矩阵 (src → ref 坐标系)
+    scale: 若有尺度补偿, 先缩放再变换
+    """
+    rot = transform_4x4[:3, :3]
+    trans = transform_4x4[:3, 3]
+
+    lines = src_obj_path.read_text(errors="ignore").splitlines()
+    out_lines = []
+
+    for line in lines:
+        if line.startswith("v "):
+            parts = line.split()
+            pt = np.array([float(parts[1]), float(parts[2]), float(parts[3])]) * scale
+            pt_new = rot @ pt + trans
+            out_lines.append(f"v {pt_new[0]:.8f} {pt_new[1]:.8f} {pt_new[2]:.8f}")
+        elif line.startswith("vn "):
+            parts = line.split()
+            n = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
+            n_new = rot @ n
+            length = np.linalg.norm(n_new)
+            if length > 1e-12:
+                n_new /= length
+            out_lines.append(f"vn {n_new[0]:.8f} {n_new[1]:.8f} {n_new[2]:.8f}")
+        elif line.startswith("mtllib "):
+            # 更新 mtllib 引用为输出文件名
+            out_lines.append(f"mtllib {out_obj_path.stem}.mtl")
+        else:
+            out_lines.append(line)
+
+    out_obj_path.parent.mkdir(parents=True, exist_ok=True)
+    out_obj_path.write_text("\n".join(out_lines) + "\n")
+
+    # 复制 mtl 文件
+    src_mtl = src_obj_path.with_suffix(".mtl")
+    out_mtl = out_obj_path.with_suffix(".mtl")
+    if src_mtl.exists():
+        import shutil
+        try:
+            # 若目标已存在且只读, 先删除
+            if out_mtl.exists():
+                out_mtl.chmod(0o644)
+            shutil.copyfile(str(src_mtl), str(out_mtl))
+        except (PermissionError, OSError):
+            try:
+                out_mtl.write_bytes(src_mtl.read_bytes())
+            except (PermissionError, OSError) as exc:
+                print(f"    [WARN] mtl 复制失败: {exc}", file=sys.stderr)
+
+    return out_obj_path
+
+
+# ──────────────────────────────────────────────
+# 7. 单对对齐核心流程
+# ──────────────────────────────────────────────
+
+def align_one_pair(
+    ref_path: Path,
+    src_path: Path,
+    out_path: Path,
+    voxel_size: float = 0.005,
+    max_icp_dist: float = 0.01,
+    num_points: int = 50000,
+    do_global: bool = True,
+    no_scale: bool = False,
+) -> dict:
+    """对齐单对模型。
+
+    Args:
+        ref_path:  低精度参考网格 (STL/OBJ)
+        src_path:  高精度待对齐网格 (OBJ)
+        out_path:  输出对齐后 OBJ 路径
+        voxel_size: 点云降采样体素大小
+        max_icp_dist: ICP 最大对应点距离
+        num_points: 采样点数
+        do_global: 是否做全局粗配准
+        no_scale: 禁用自动尺度补偿 (默认自动检测并补偿)
+
+    Returns:
+        dict 包含 transform, scale, fitness, rmse 等信息
+    """
+    print(f"  加载参考网格: {ref_path.name}")
+    pcd_ref = mesh_to_pointcloud(ref_path, num_points)
+
+    print(f"  加载源网格:   {src_path.name}")
+    pcd_src = mesh_to_pointcloud(src_path, num_points)
+
+    # ---- 尺度自动检测与补偿 (默认开启) ----
+    scale = 1.0
+    ref_diag = _get_pcd_diagonal(pcd_ref)
+    src_diag = _get_pcd_diagonal(pcd_src)
+    print(f"  ref 对角线={ref_diag:.4f}, src 对角线={src_diag:.4f}")
+
+    if not no_scale:
+        scale = estimate_scale(pcd_ref, pcd_src)
+        if abs(scale - 1.0) > 0.01:
+            print(f"  应用尺度补偿: src × {scale}")
+            pts = np.asarray(pcd_src.points) * scale
+            pcd_src.points = o3d.utility.Vector3dVector(pts)
+        else:
+            scale = 1.0
+            print(f"  尺度接近 1.0, 无需补偿")
+    else:
+        print(f"  尺度补偿已禁用 (--no-scale)")
+
+    # ---- 自动参数估算 (在尺度补偿之后计算, 确保参数正确) ----
+    if voxel_size <= 0 or max_icp_dist <= 0:
+        auto_vs, auto_icp = auto_params(pcd_ref, pcd_src)
+        if voxel_size <= 0:
+            voxel_size = auto_vs
+        if max_icp_dist <= 0:
+            max_icp_dist = auto_icp
+        print(f"  自动参数: voxel_size={voxel_size:.4f}, max_icp_dist={max_icp_dist:.4f}")
+
+    # ---- 全局配准 ----
+    init_transform = np.eye(4)
+    if do_global:
+        print(f"  FPFH 特征提取 (voxel_size={voxel_size:.4f}) ...")
+        src_down, src_fpfh = preprocess_pcd(pcd_src, voxel_size)
+        ref_down, ref_fpfh = preprocess_pcd(pcd_ref, voxel_size)
+
+        print(f"  RANSAC 全局粗配准 ...")
+        global_result = global_registration(src_down, ref_down, src_fpfh, ref_fpfh, voxel_size)
+        init_transform = global_result.transformation
+        print(f"    粗配准 fitness={global_result.fitness:.4f}, RMSE={global_result.inlier_rmse:.6f}")
+
+    # ---- ICP 精细配准 ----
+    print(f"  ICP 精细配准 (max_dist={max_icp_dist}) ...")
+    # 多尺度 ICP: 从粗到细
+    current_transform = init_transform
+    for dist_factor in [5.0, 2.0, 1.0]:
+        dist = max_icp_dist * dist_factor
+        icp_result = refine_icp(pcd_src, pcd_ref, current_transform, dist)
+        current_transform = icp_result.transformation
+
+    final_transform = current_transform
+    print(f"    精配准 fitness={icp_result.fitness:.4f}, RMSE={icp_result.inlier_rmse:.6f}")
+
+    # ---- 应用变换到 OBJ ----
+    print(f"  输出对齐后 OBJ: {out_path}")
+    if src_path.suffix.lower() == ".obj":
+        apply_transform_to_obj(src_path, out_path, final_transform, scale)
+    else:
+        # STL 等格式: 用 trimesh 变换后导出
+        tm = trimesh.load(str(src_path), force="mesh")
+        if scale != 1.0:
+            tm.vertices *= scale
+        tm.apply_transform(final_transform)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tm.export(str(out_path))
+
     return {
-        "mean_mm":   dists.mean() * 1000,
-        "median_mm": np.median(dists) * 1000,
-        "p95_mm":    np.percentile(dists, 95) * 1000,
-        "max_mm":    dists.max() * 1000,
+        "ref": str(ref_path),
+        "src": str(src_path),
+        "out": str(out_path),
+        "transform": final_transform.tolist(),
+        "scale": scale,
+        "fitness": icp_result.fitness,
+        "rmse": icp_result.inlier_rmse,
     }
 
 
-# ─────────────────────────────────────────
-# 5. 主流程
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 8. 批量对齐
+# ──────────────────────────────────────────────
+
+def batch_align(
+    ref_dir: Path,
+    src_dir: Path,
+    out_dir: Path,
+    ref_ext: str = ".STL",
+    src_ext: str = ".obj",
+    **kwargs,
+) -> list[dict]:
+    """批量对齐同名零件。"""
+    ref_files = sorted(ref_dir.glob(f"*{ref_ext}"))
+    results = []
+    success = 0
+    fail = 0
+
+    for ref_file in ref_files:
+        part_name = ref_file.stem
+        src_file = src_dir / f"{part_name}{src_ext}"
+        if not src_file.exists():
+            # 尝试大小写不敏感匹配
+            candidates = [f for f in src_dir.iterdir()
+                          if f.stem.lower() == part_name.lower() and f.suffix.lower() == src_ext.lower()]
+            if candidates:
+                src_file = candidates[0]
+            else:
+                print(f"  [跳过] {part_name}: 未找到对应的源模型 {src_ext}")
+                continue
+
+        out_file = out_dir / f"{part_name}.obj"
+        print(f"\n{'='*60}")
+        print(f"对齐: {part_name}")
+        print(f"{'='*60}")
+
+        try:
+            result = align_one_pair(ref_file, src_file, out_file, **kwargs)
+            results.append(result)
+            success += 1
+            print(f"  ✓ fitness={result['fitness']:.4f}, RMSE={result['rmse']:.6f}")
+        except Exception as exc:
+            print(f"  ✗ 失败: {exc}", file=sys.stderr)
+            fail += 1
+            results.append({"ref": str(ref_file), "src": str(src_file), "error": str(exc)})
+
+    print(f"\n{'='*60}")
+    print(f"批量对齐完成: 成功 {success}/{success+fail}, 失败 {fail}")
+    print(f"{'='*60}")
+
+    # 保存变换矩阵记录
+    import json
+    record_path = out_dir / "alignment_record.json"
+    record_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    print(f"变换记录已保存: {record_path}")
+
+    return results
+
+
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="将高精度网格对齐到低精度网格的坐标系（FPFH+RANSAC+ICP）")
-    parser.add_argument("target", help="目标坐标系网格文件（低精度，STL 或 OBJ）")
-    parser.add_argument("source", help="待对齐网格文件（高精度，STL 或 OBJ）")
-    parser.add_argument("-o", "--output", default="aligned.obj", help="输出文件路径（默认 aligned.obj）")
-    parser.add_argument("-n", "--n-points", type=int, default=50000, help="采样点数（默认 50000）")
-    parser.add_argument("-v", "--voxel-size", type=float, default=0.0, help="体素大小（米），0 表示自动推算")
-    parser.add_argument("--save-matrix", default="transform.npy", help="保存 4×4 变换矩阵路径")
+    parser = argparse.ArgumentParser(
+        description="将高精度模型对齐到低精度参考模型的坐标系 (FPFH + RANSAC + ICP)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 单对对齐
+  python align_meshes.py --ref ref.STL --src high.obj --out aligned.obj
+
+  # 批量对齐 (自动匹配同名零件)
+  python align_meshes.py \\
+      --ref-dir chairbot-urdf-0212/meshes \\
+      --src-dir id_mesh/meshes_aligned \\
+      --out-dir id_mesh/meshes_output
+
+  # 禁用自动尺度补偿 (若确定两模型尺度一致)
+  python align_meshes.py --ref ref.STL --src high.obj --out aligned.obj --no-scale
+        """,
+    )
+
+    # 单对模式
+    parser.add_argument("--ref", type=Path, help="低精度参考网格路径 (STL/OBJ)")
+    parser.add_argument("--src", type=Path, help="高精度待对齐网格路径 (OBJ)")
+    parser.add_argument("--out", type=Path, help="输出对齐后网格路径")
+
+    # 批量模式
+    parser.add_argument("--ref-dir", type=Path, help="低精度参考网格目录")
+    parser.add_argument("--src-dir", type=Path, help="高精度待对齐网格目录")
+    parser.add_argument("--out-dir", type=Path, help="输出目录")
+    parser.add_argument("--ref-ext", default=".STL", help="参考模型扩展名 (默认 .STL)")
+    parser.add_argument("--src-ext", default=".obj", help="源模型扩展名 (默认 .obj)")
+
+    # 算法参数
+    parser.add_argument("--voxel-size", type=float, default=0,
+                        help="降采样体素大小 (默认 0=自动, 按模型对角线 1.5%% 估算)")
+    parser.add_argument("--max-icp-dist", type=float, default=0,
+                        help="ICP 最大对应点距离 (默认 0=自动, 按模型对角线 5%% 估算)")
+    parser.add_argument("--num-points", type=int, default=100000,
+                        help="采样点数 (默认 100000)")
+    parser.add_argument("--no-global", action="store_true",
+                        help="跳过全局配准 (仅当初始对齐已大致正确时)")
+    parser.add_argument("--no-scale", action="store_true",
+                        help="禁用自动尺度补偿 (默认自动检测 mm/cm/m 等尺度差异)")
+
     args = parser.parse_args()
 
-    print(f"[1/5] 加载目标网格: {args.target}")
-    tgt_pcd = load_and_sample(args.target, args.n_points)
+    common_kwargs = dict(
+        voxel_size=args.voxel_size,
+        max_icp_dist=args.max_icp_dist,
+        num_points=args.num_points,
+        do_global=not args.no_global,
+        no_scale=args.no_scale,
+    )
 
-    print(f"[2/5] 加载源网格: {args.source}")
-    src_pcd = load_and_sample(args.source, args.n_points)
-
-    # 自动推算 voxel_size：模型对角线的 1%
-    if args.voxel_size <= 0:
-        pts = np.asarray(tgt_pcd.points)
-        diag = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
-        voxel_size = diag * 0.01
+    if args.ref_dir and args.src_dir:
+        # 批量模式
+        out_dir = args.out_dir or (args.src_dir.parent / "meshes_output")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        batch_align(
+            args.ref_dir, args.src_dir, out_dir,
+            ref_ext=args.ref_ext, src_ext=args.src_ext,
+            **common_kwargs,
+        )
+    elif args.ref and args.src:
+        # 单对模式
+        out = args.out or args.src.with_name(args.src.stem + "_aligned.obj")
+        result = align_one_pair(args.ref, args.src, out, **common_kwargs)
+        print(f"\n完成! fitness={result['fitness']:.4f}, RMSE={result['rmse']:.6f}")
+        print(f"变换矩阵:\n{np.array(result['transform'])}")
     else:
-        voxel_size = args.voxel_size
-    print(f"      voxel_size = {voxel_size*1000:.2f} mm")
-
-    print("[3/5] 提取 FPFH 特征...")
-    src_down, src_fpfh = preprocess(src_pcd, voxel_size)
-    tgt_down, tgt_fpfh = preprocess(tgt_pcd, voxel_size)
-    print(f"      下采样点数: src={len(src_down.points)}  tgt={len(tgt_down.points)}")
-
-    print("[4/5] RANSAC 全局配准...")
-    ransac_result = ransac_registration(src_down, tgt_down, src_fpfh, tgt_fpfh, voxel_size)
-    print(f"      RANSAC → RMSE={ransac_result.inlier_rmse*1000:.4f}mm  fitness={ransac_result.fitness:.4f}")
-
-    print("      ICP 精配准...")
-    icp_result = refine_icp(src_pcd, tgt_pcd, ransac_result.transformation, voxel_size)
-    print(f"      ICP   → RMSE={icp_result.inlier_rmse*1000:.4f}mm  fitness={icp_result.fitness:.4f}")
-
-    best_T = icp_result.transformation
-
-    # 精度验证
-    print("\n[精度验证] 最近邻点距离统计...")
-    stats = evaluate(src_pcd, tgt_pcd, best_T)
-    print(f"  Mean:   {stats['mean_mm']:.4f} mm")
-    print(f"  Median: {stats['median_mm']:.4f} mm")
-    print(f"  P95:    {stats['p95_mm']:.4f} mm")
-    print(f"  Max:    {stats['max_mm']:.4f} mm")
-
-    ok = stats['median_mm'] <= 0.1
-    print(f"\n{'✅' if ok else '⚠️ '} 中位误差 {stats['median_mm']:.4f}mm {'达到' if ok else '未达到'} 0.1mm 目标")
-
-    print(f"\n变换矩阵 (4×4):\n{np.round(best_T, 8)}")
-    np.save(args.save_matrix, best_T)
-    print(f"\n[5/5] 变换矩阵已保存: {args.save_matrix}")
-
-    # 保留材质导出
-    mesh_src = trimesh.load(args.source)
-    mesh_src.apply_transform(best_T)
-    mesh_src.export(args.output)
-    print(f"对齐后的网格已保存: {args.output}")
+        parser.error("请指定 --ref/--src (单对模式) 或 --ref-dir/--src-dir (批量模式)")
 
 
 if __name__ == "__main__":
