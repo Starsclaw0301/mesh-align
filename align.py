@@ -91,38 +91,61 @@ def pca_rough_align(
 # 3. ICP 精配准
 # ─────────────────────────────────────────
 
+def adaptive_icp_distances(pcd: o3d.geometry.PointCloud) -> tuple[float, float, float]:
+    """根据模型 AABB 对角线自适应计算三阶段 ICP 距离阈值"""
+    pts = np.asarray(pcd.points)
+    diag = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
+    coarse = diag * 0.05    # 对角线 5%（粗配准容差）
+    mid    = diag * 0.005   # 对角线 0.5%
+    fine   = 0.0001         # 固定 0.1mm（目标精度）
+    return coarse, mid, fine
+
+
 def run_icp(
     src_pcd: o3d.geometry.PointCloud,
     tgt_pcd: o3d.geometry.PointCloud,
     init_transform: np.ndarray,
-    max_dist: float = 0.005,   # 初始最大对应距离 5mm
-    fine_dist: float = 0.0001, # 精配准收紧到 0.1mm
 ) -> o3d.pipelines.registration.RegistrationResult:
-    """两阶段 ICP：先粗后精"""
+    """三阶段 ICP：粗 → 中 → 精，距离阈值自适应"""
+    coarse_dist, mid_dist, fine_dist = adaptive_icp_distances(tgt_pcd)
 
-    # 粗 ICP
-    result_coarse = o3d.pipelines.registration.registration_icp(
+    icp_cfg = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+
+    # 阶段 1：粗 ICP
+    r1 = o3d.pipelines.registration.registration_icp(
         src_pcd, tgt_pcd,
-        max_correspondence_distance=max_dist,
+        max_correspondence_distance=coarse_dist,
         init=init_transform,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        estimation_method=icp_cfg,
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+            relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=100
+        ),
+    )
+
+    # 阶段 2：中 ICP
+    r2 = o3d.pipelines.registration.registration_icp(
+        src_pcd, tgt_pcd,
+        max_correspondence_distance=mid_dist,
+        init=r1.transformation,
+        estimation_method=icp_cfg,
         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
             relative_fitness=1e-7, relative_rmse=1e-7, max_iteration=200
         ),
     )
 
-    # 精 ICP（从粗配准结果继续）
-    result_fine = o3d.pipelines.registration.registration_icp(
+    # 阶段 3：精 ICP
+    r3 = o3d.pipelines.registration.registration_icp(
         src_pcd, tgt_pcd,
         max_correspondence_distance=fine_dist,
-        init=result_coarse.transformation,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        init=r2.transformation,
+        estimation_method=icp_cfg,
         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
             relative_fitness=1e-9, relative_rmse=1e-9, max_iteration=500
         ),
     )
 
-    return result_fine
+    # 精配准 fitness 太低说明 0.1mm 容差太紧，回退到中配准结果
+    return r3 if r3.fitness > 0.01 else r2
 
 
 # ─────────────────────────────────────────
@@ -149,7 +172,7 @@ def main():
 
     print("[4/5] ICP 精配准（逐候选测试，取最优）...")
     best_result = None
-    best_rmse = float("inf")
+    best_fitness = -1.0
 
     for i, T_init in enumerate(candidates):
         try:
@@ -157,14 +180,14 @@ def main():
             rmse_mm = result.inlier_rmse * 1000
             fitness = result.fitness
             print(f"  候选 {i+1}/4 → RMSE={rmse_mm:.4f}mm  fitness={fitness:.4f}")
-            if result.inlier_rmse < best_rmse and fitness > 0.1:
-                best_rmse = result.inlier_rmse
+            if fitness > best_fitness:
+                best_fitness = fitness
                 best_result = result
         except Exception as e:
             print(f"  候选 {i+1} 失败: {e}")
 
-    if best_result is None:
-        print("❌ 所有候选配准均失败，请检查输入模型。")
+    if best_result is None or best_fitness < 0.01:
+        print("❌ 配准失败（fitness 过低），请检查输入模型是否形状一致。")
         sys.exit(1)
 
     best_T = best_result.transformation
