@@ -195,64 +195,54 @@ def refine_icp(
     src_pcd: o3d.geometry.PointCloud,
     ref_pcd: o3d.geometry.PointCloud,
     init_transform: np.ndarray,
-    max_distance: float,
+    ransac_rmse: float,
 ) -> o3d.pipelines.registration.RegistrationResult:
-    """Point-to-Plane ICP 多阶段精细配准，最终收紧到 0.1mm。"""
+    """Point-to-Plane ICP 多阶段精细配准。
+
+    从 RANSAC RMSE 出发逐步收紧到 0.1mm，每阶段距离不超过上一阶段的 1/3。
+    """
     icp_method = o3d.pipelines.registration.TransformationEstimationPointToPlane()
 
-    def _ensure_normals(pcd, radius):
-        pcd.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=50)
-        )
-        o3d.geometry.PointCloud.orient_normals_consistent_tangent_plane(pcd, 20)
-
-    # 阶段1~3：从粗到细，基于 max_distance 逐步收紧
-    current_transform = init_transform
-    for dist_factor, max_iter in [(5.0, 100), (2.0, 200), (1.0, 300)]:
-        dist = max_distance * dist_factor
-        _ensure_normals(src_pcd, dist * 2)
-        _ensure_normals(ref_pcd, dist * 2)
-        r = o3d.pipelines.registration.registration_icp(
-            source=src_pcd,
-            target=ref_pcd,
+    def _icp(src, ref, T, dist, max_iter):
+        radius = max(dist * 2, 0.0002)
+        src.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=50))
+        ref.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=50))
+        o3d.geometry.PointCloud.orient_normals_consistent_tangent_plane(src, 20)
+        o3d.geometry.PointCloud.orient_normals_consistent_tangent_plane(ref, 20)
+        return o3d.pipelines.registration.registration_icp(
+            source=src, target=ref,
             max_correspondence_distance=dist,
-            init=current_transform,
+            init=T,
             estimation_method=icp_method,
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=max_iter,
+                relative_fitness=1e-10, relative_rmse=1e-10, max_iteration=max_iter,
             ),
         )
-        current_transform = r.transformation
 
-    # 阶段4：固定收紧到 1mm
-    _ensure_normals(src_pcd, 0.002)
-    _ensure_normals(ref_pcd, 0.002)
-    r = o3d.pipelines.registration.registration_icp(
-        source=src_pcd, target=ref_pcd,
-        max_correspondence_distance=0.001,
-        init=current_transform,
-        estimation_method=icp_method,
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-10, relative_rmse=1e-10, max_iteration=500,
-        ),
-    )
-    current_transform = r.transformation
+    # 构造从 RANSAC RMSE 到 0.1mm 的对数等比收紧序列
+    import math
+    start = ransac_rmse * 2          # 从 RANSAC RMSE 的 2 倍开始
+    end   = 0.0001                   # 目标 0.1mm
+    n_stages = max(4, int(math.log(start / end) / math.log(3)) + 1)
+    stages = [start / (3 ** i) for i in range(n_stages)]
+    stages = [d for d in stages if d >= end]
+    if stages[-1] > end:
+        stages.append(end)
 
-    # 阶段5：最终收紧到 0.1mm（目标精度）
-    _ensure_normals(src_pcd, 0.0005)
-    _ensure_normals(ref_pcd, 0.0005)
-    r_final = o3d.pipelines.registration.registration_icp(
-        source=src_pcd, target=ref_pcd,
-        max_correspondence_distance=0.0001,
-        init=current_transform,
-        estimation_method=icp_method,
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-12, relative_rmse=1e-12, max_iteration=1000,
-        ),
-    )
+    T = init_transform
+    result = None
+    for i, dist in enumerate(stages):
+        iters = 200 if dist > 0.001 else 500
+        r = _icp(src_pcd, ref_pcd, T, dist, iters)
+        print(f"      阶段{i+1} dist={dist*1000:.3f}mm → fitness={r.fitness:.4f} RMSE={r.inlier_rmse*1000:.4f}mm")
+        # 如果 fitness 下降超过 50%，说明这一阶段把结果带偏了，停止并回退
+        if result is not None and r.fitness < result.fitness * 0.5:
+            print(f"      fitness 下降过多，回退到上一阶段")
+            break
+        result = r
+        T = r.transformation
 
-    # 若最终阶段 fitness 太低（说明对齐还不够好，0.1mm 容差找不到足够对应点），回退到上一阶段
-    return r_final if r_final.fitness > r.fitness * 0.5 else r
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -394,13 +384,9 @@ def align_one_pair(
 
     # ---- ICP 精细配准 ----
     print(f"  ICP 精细配准 ...")
-    # 起始距离取 RANSAC RMSE 的 3 倍（保证初始有足够对应点），再逐步收紧
-    if do_global:
-        icp_start_dist = max(global_result.inlier_rmse * 3, max_icp_dist)
-    else:
-        icp_start_dist = max_icp_dist
-    print(f"    ICP 起始距离={icp_start_dist*1000:.2f}mm")
-    icp_result = refine_icp(pcd_src, pcd_ref, init_transform, icp_start_dist)
+    ransac_rmse = global_result.inlier_rmse if do_global else max_icp_dist
+    print(f"    起始 RMSE={ransac_rmse*1000:.2f}mm，逐步收紧到 0.1mm")
+    icp_result = refine_icp(pcd_src, pcd_ref, init_transform, ransac_rmse)
 
     final_transform = icp_result.transformation
     print(f"    精配准 fitness={icp_result.fitness:.4f}, RMSE={icp_result.inlier_rmse*1000:.4f}mm")
