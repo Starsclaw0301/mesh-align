@@ -179,11 +179,10 @@ def main():
     np.save(args.save_matrix, best_T)
     print(f"\n[5/5] 变换矩阵已保存: {args.save_matrix}")
 
-    # 应用变换并输出对齐后的文件
-    mesh_src = trimesh.load(args.source, force="mesh")
-    if isinstance(mesh_src, trimesh.Scene):
-        mesh_src = trimesh.util.concatenate(list(mesh_src.geometry.values()))
-    mesh_src.apply_transform(best_T)
+    # 应用变换并输出对齐后的文件（保留材质）
+    # 注意：不使用 force="mesh"，保留 Scene 结构和 MTL 材质信息
+    mesh_src = trimesh.load(args.source)
+    mesh_src.apply_transform(best_T)  # Scene 或 Mesh 均支持此方法
     mesh_src.export(args.output)
     print(f"对齐后的网格已保存: {args.output}")
 
