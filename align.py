@@ -199,30 +199,62 @@ def refine_icp(
     init_transform: np.ndarray,
     max_distance: float,
 ) -> o3d.pipelines.registration.RegistrationResult:
-    """Point-to-Plane ICP 精细配准。"""
-    # 确保有法线
-    if not src_pcd.has_normals():
-        src_pcd.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(radius=max_distance * 2, max_nn=30)
-        )
-    if not ref_pcd.has_normals():
-        ref_pcd.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(radius=max_distance * 2, max_nn=30)
-        )
+    """Point-to-Plane ICP 多阶段精细配准，最终收紧到 0.1mm。"""
+    icp_method = o3d.pipelines.registration.TransformationEstimationPointToPlane()
 
-    result = o3d.pipelines.registration.registration_icp(
-        source=src_pcd,
-        target=ref_pcd,
-        max_correspondence_distance=max_distance,
-        init=init_transform,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+    def _ensure_normals(pcd, radius):
+        pcd.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=50)
+        )
+        o3d.geometry.PointCloud.orient_normals_consistent_tangent_plane(pcd, 20)
+
+    # 阶段1~3：从粗到细，基于 max_distance 逐步收紧
+    current_transform = init_transform
+    for dist_factor, max_iter in [(5.0, 100), (2.0, 200), (1.0, 300)]:
+        dist = max_distance * dist_factor
+        _ensure_normals(src_pcd, dist * 2)
+        _ensure_normals(ref_pcd, dist * 2)
+        r = o3d.pipelines.registration.registration_icp(
+            source=src_pcd,
+            target=ref_pcd,
+            max_correspondence_distance=dist,
+            init=current_transform,
+            estimation_method=icp_method,
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                relative_fitness=1e-8, relative_rmse=1e-8, max_iteration=max_iter,
+            ),
+        )
+        current_transform = r.transformation
+
+    # 阶段4：固定收紧到 1mm
+    _ensure_normals(src_pcd, 0.002)
+    _ensure_normals(ref_pcd, 0.002)
+    r = o3d.pipelines.registration.registration_icp(
+        source=src_pcd, target=ref_pcd,
+        max_correspondence_distance=0.001,
+        init=current_transform,
+        estimation_method=icp_method,
         criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-8,
-            relative_rmse=1e-8,
-            max_iteration=200,
+            relative_fitness=1e-10, relative_rmse=1e-10, max_iteration=500,
         ),
     )
-    return result
+    current_transform = r.transformation
+
+    # 阶段5：最终收紧到 0.1mm（目标精度）
+    _ensure_normals(src_pcd, 0.0005)
+    _ensure_normals(ref_pcd, 0.0005)
+    r_final = o3d.pipelines.registration.registration_icp(
+        source=src_pcd, target=ref_pcd,
+        max_correspondence_distance=0.0001,
+        init=current_transform,
+        estimation_method=icp_method,
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+            relative_fitness=1e-12, relative_rmse=1e-12, max_iteration=1000,
+        ),
+    )
+
+    # 若最终阶段 fitness 太低（说明对齐还不够好，0.1mm 容差找不到足够对应点），回退到上一阶段
+    return r_final if r_final.fitness > r.fitness * 0.5 else r
 
 
 # ──────────────────────────────────────────────
@@ -372,7 +404,18 @@ def align_one_pair(
         current_transform = icp_result.transformation
 
     final_transform = current_transform
-    print(f"    精配准 fitness={icp_result.fitness:.4f}, RMSE={icp_result.inlier_rmse:.6f}")
+    print(f"    精配准 fitness={icp_result.fitness:.4f}, RMSE={icp_result.inlier_rmse*1000:.4f}mm")
+
+    # 精度验证：最近邻点距离统计
+    src_eval = o3d.geometry.PointCloud(pcd_src)
+    src_eval.transform(final_transform)
+    dists = np.asarray(src_eval.compute_point_cloud_distance(pcd_ref)) * 1000  # mm
+    print(f"    [精度验证] mean={dists.mean():.4f}mm  median={np.median(dists):.4f}mm  "
+          f"p95={np.percentile(dists,95):.4f}mm  max={dists.max():.4f}mm")
+    if np.median(dists) <= 0.1:
+        print(f"    ✅ 中位误差 {np.median(dists):.4f}mm ≤ 0.1mm，达到目标精度")
+    else:
+        print(f"    ⚠️  中位误差 {np.median(dists):.4f}mm > 0.1mm，未达到目标精度")
 
     # ---- 应用变换到 OBJ ----
     print(f"  输出对齐后 OBJ: {out_path}")
